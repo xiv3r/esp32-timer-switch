@@ -9,7 +9,7 @@
 - https://github.com/xiv3r/esp32-timer-switch/raw/refs/heads/main/esp32-dump-0x0.bin
 
 # Wifi Key
-- SSID: ESP32-TIMER-XXXX
+- SSID: ESP32-Relay-XXXX
 - PASSWORD: esp32relay
 
 ## 16 CHANNEL RELAY GPIO Connection 
