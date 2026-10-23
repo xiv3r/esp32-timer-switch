@@ -5,12 +5,12 @@
 - 20 F-F Dupont Wires
 
 # Installation
-> download and Flash the firmware to offset `0x0`
+> Download and Flash the firmware to offset `0x0`
 - https://github.com/xiv3r/esp32-timer-switch/raw/refs/heads/main/esp32-dump-0x0.bin
 
 # Wifi Key
-- SSID: ESP32-Relay-XXXX
-- PASSWORD: esp32relay
+- SSID: `ESP32_Timer_Switch_XXXX`
+- PASSWORD: `12345678`
 
 ## 16 CHANNEL RELAY GPIO Connection 
 ```
