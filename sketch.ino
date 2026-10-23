@@ -1,3 +1,12 @@
+/*
+===============================================================================
+ *  ESP32 16-Channel Automatic Relay Timer Switch
+ *  Author: Raff Alds
+ *  Github: https://www.github.com/xiv3r
+ *  License: MIT
+===============================================================================
+*/
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WiFiUdp.h>
