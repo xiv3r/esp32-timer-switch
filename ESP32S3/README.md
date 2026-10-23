@@ -1,5 +1,5 @@
 # Requirements
-- 1 esp32s3
+- 1 esp32s3 n16r8
 - 2 8 channel relay
 - 1 ds3231 rtc module + cr2038 battery
 - 20 F-F Dupont Wires
