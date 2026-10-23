@@ -415,8 +415,8 @@ static void defaultNetCfg() {
   netCfg.sta.enabled = false;
   netCfg.sta.dhcp = true;
   netCfg.ap.enabled = true;
-  snprintf(netCfg.ap.ssid, sizeof(netCfg.ap.ssid), "ESP32-Relay-%02X%02X", mac[4], mac[5]);
-  strcopy(netCfg.ap.pass, sizeof(netCfg.ap.pass), "esp32relay");
+  snprintf(netCfg.ap.ssid, sizeof(netCfg.ap.ssid), "ESP32_Timer_Switch_%02X%02X", mac[4], mac[5]);
+  strcopy(netCfg.ap.pass, sizeof(netCfg.ap.pass), "12345678");
   netCfg.ap.channel = 1;
   netCfg.ap.hidden = false;
   netCfg.ap.maxConn = 4;
