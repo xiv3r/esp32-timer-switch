@@ -2,7 +2,7 @@
 ===============================================================================
  *  ESP32S3 16-Channel Automatic Relay Timer Switch
  *  Author: Raff Alds
- *  Github: https://www.github.com/xiv3r
+ *  Github: github.com/xiv3r
  *  License: MIT
 ===============================================================================
 */
