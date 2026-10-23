@@ -1605,7 +1605,7 @@ static void startAp() {
   bool ok = WiFi.softAP(netCfg.ap.ssid, pass, netCfg.ap.channel, netCfg.ap.hidden ? 1 : 0, netCfg.ap.maxConn);
   if (!ok) {
     char fb[33]; uint8_t mac[6]; WiFi.macAddress(mac);
-    snprintf(fb, sizeof fb, "ESP32-Relay-%02X%02X", mac[4], mac[5]);
+    snprintf(fb, sizeof fb, "ESP32_Timer_Switch_%02X%02X", mac[4], mac[5]);
     WiFi.softAP(fb, nullptr, 1, 0, 4);
   }
   IPAddress ip(netCfg.ap.ip);
