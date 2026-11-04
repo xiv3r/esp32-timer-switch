@@ -1123,6 +1123,8 @@ static uint32_t rtcWriteReqMs = 0;
 static void rtcCancelAlign();
 
 static void setSystemTime(double epoch, TimeSrc src) {
+  if (epoch < (double)MIN_VALID_EPOCH) return;
+  if (!timeT64() && epoch > 2147483647.0) epoch = 2147483647.0;
   struct timeval tv;
   tv.tv_sec = (time_t)epoch;
   tv.tv_usec = (suseconds_t)((epoch - (double)tv.tv_sec) * 1e6);
@@ -2046,7 +2048,8 @@ static void apiTimeSet() {
   double epoch = d["epoch"].as<double>();
   int ms = d["ms"] | 0;
   if (ms < 0 || ms > 999) ms = 0;
-  if (epoch < (double)MIN_VALID_EPOCH || epoch > 4102444800.0) { sendErr(400, "epoch out of range"); return; }
+  double maxEpoch = timeT64() ? 4102444800.0 : 2147483647.0;
+  if (epoch < (double)MIN_VALID_EPOCH || epoch > maxEpoch) { sendErr(400, "epoch out of range"); return; }
   setSystemTime(epoch + ms / 1000.0, SRC_BROWSER);
   JsonDocument o; fillTimeStatus(o.to<JsonObject>()); sendDoc(o);
 }
@@ -2723,4 +2726,3 @@ void loop() {
     ESP.restart();
   }
 }
-
