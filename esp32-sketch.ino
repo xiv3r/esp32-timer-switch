@@ -1202,11 +1202,25 @@ static void setSystemTime(double epoch, TimeSrc src) {
 
 static bool rtcUsable();
 
-template <typename R>
-static auto rtcAdjust(R& r, DateTime d, int) -> decltype(r.adjust(d), bool()) { return r.adjust(d); }
-template <typename R>
-static bool rtcAdjust(R& r, DateTime d, long) { r.adjust(d); return true; }
-static bool rtcWriteTime(uint32_t epoch) { return rtcAdjust(rtc, DateTime(epoch), 0); }
+namespace rtc_detail {
+  template <typename T> struct IsVoid { static const bool value = false; };
+  template <> struct IsVoid<void> { static const bool value = true; };
+
+  template <typename R, bool VOID_ADJUST>
+  struct AdjustImpl;
+  template <typename R>
+  struct AdjustImpl<R, true>  { static bool call(R& r, const DateTime& d) { r.adjust(d); return true; } };
+  template <typename R>
+  struct AdjustImpl<R, false> { static bool call(R& r, const DateTime& d) { return r.adjust(d); } };
+
+  template <typename R>
+  struct Adjust {
+    static bool call(R& r, const DateTime& d) {
+      return AdjustImpl<R, IsVoid<decltype(r.adjust(d))>::value>::call(r, d);
+    }
+  };
+}
+static bool rtcWriteTime(uint32_t epoch) { return rtc_detail::Adjust<RTC_DS3231>::call(rtc, DateTime(epoch)); }
 
 static void rtcProbe() {
   if (!timeCfg.rtcEnabled) { rtcPresent = false; rtcSeedReq = false; return; }
