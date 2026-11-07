@@ -30,7 +30,7 @@
 #include "lwip/ip_addr.h"
 
 #define FW_VERSION        "1.0.0"
-#define ASSET_VERSION     "5"
+#define ASSET_VERSION     "6"
 
 static const uint8_t NUM_RELAYS   = 16;
 static const uint8_t NUM_PAIRS    = 8;
@@ -632,6 +632,7 @@ static void relayFromDoc(uint8_t i, JsonDocument& d) {
     strcopy(p.bText, sizeof(p.bText), o["b"] | "");
     trimInPlace(p.aText); trimInPlace(p.bText);
     parseSpecInto(p);
+    if (p.en && p.a.never && p.b.never) p.en = false;
   }
 }
 
@@ -841,22 +842,64 @@ static int latestTimeOfDay(const Spec& s, int limit) {
   return -1;
 }
 
+static time_t pseudoToReal(int64_t pseudo) {
+  int64_t days = pseudo / 86400;
+  int tod = (int)(pseudo % 86400);
+  if (tod < 0) { days--; tod += 86400; }
+  int y, m, d;
+  civilFromDays(days, y, m, d);
+  const int hh = tod / 3600;
+  const int mm = (tod / 60) % 60;
+  const int ss = tod % 60;
+  for (int dst = 0; dst <= 1; dst++) {
+    struct tm lt = {};
+    lt.tm_year = y - 1900;
+    lt.tm_mon  = m - 1;
+    lt.tm_mday = d;
+    lt.tm_hour = hh;
+    lt.tm_min  = mm;
+    lt.tm_sec  = ss;
+    lt.tm_isdst = dst;
+    time_t cand = mktime(&lt);
+    if (cand == (time_t)-1) continue;
+    struct tm back;
+    localtime_r(&cand, &back);
+    if (back.tm_year + 1900 == y && back.tm_mon + 1 == m && back.tm_mday == d &&
+        back.tm_hour == hh && back.tm_min == mm && back.tm_sec == ss) {
+      return cand;
+    }
+  }
+  return (time_t)-1;
+}
+
 static int64_t findPrevMatch(const Spec& s, const struct tm& now) {
   if (s.never) return -1;
   const int64_t D0 = daysFromCivil(now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
   const int S0 = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec;
-  const int64_t Dmin = D0 - DAY_LOOKBACK;
+  int64_t Dmin = D0 - DAY_LOOKBACK;
+  if (s.y1 != 0xFFFF && (int)s.y1 < now.tm_year + 1900 - 8) {
+    int64_t yStart = daysFromCivil((int)s.y0, 1, 1);
+    if (yStart - 1 < Dmin) Dmin = yStart - 1;
+  }
   int64_t D = D0;
+  const int guardLimit = (int)(D0 - Dmin) + 64;
   int guard = 0;
-  while (D > Dmin && guard++ < 20000) {
+  while (D > Dmin && guard++ < guardLimit) {
     int y, m, d;
     civilFromDays(D, y, m, d);
     if (y > s.y1) { D = daysFromCivil(s.y1, 12, 31); continue; }
     if (y < s.y0) return -1;
     if (!((s.mon >> m) & 1u)) { D = daysFromCivil(y, m, 1) - 1; continue; }
     if (!((s.dom >> d) & 1u) || !((s.dow >> dowFromDays(D)) & 1u)) { D--; continue; }
-    int tod = latestTimeOfDay(s, (D == D0) ? S0 : 86399);
-    if (tod >= 0) return D * 86400LL + tod;
+    int limit = (D == D0) ? S0 : 86399;
+    int tod = latestTimeOfDay(s, limit);
+    while (tod >= 0) {
+      int64_t pseudo = D * 86400LL + tod;
+      if (pseudoToReal(pseudo) != (time_t)-1) return pseudo;
+      limit = tod - 1;
+      if (limit < 0) break;
+      tod = latestTimeOfDay(s, limit);
+    }
     D--;
   }
   return -1;
@@ -1122,6 +1165,19 @@ static uint32_t rtcWriteReqMs = 0;
 
 static void rtcCancelAlign();
 
+static bool     rtcPresent = false;
+static bool     rtcLost = false;
+static time_t   rtcEpoch = 0;
+static float    rtcTemp = 0;
+static int32_t  rtcDrift = 0;
+static uint32_t rtcReadMs = 0, rtcTempMs = 0, rtcProbeMs = 0;
+static bool     rtcAlignReq = false;
+static uint32_t rtcAlignStartMs = 0;
+static time_t   rtcAlignPrev = 0;
+static uint32_t rtcSetCount = 0;
+static bool     rtcSeedReq = false;
+static uint32_t rtcLostRetryMs = 0;
+
 static void setSystemTime(double epoch, TimeSrc src) {
   if (epoch < (double)MIN_VALID_EPOCH) return;
   if (!timeT64() && epoch > 2147483647.0) epoch = 2147483647.0;
@@ -1134,37 +1190,38 @@ static void setSystemTime(double epoch, TimeSrc src) {
   timeSrc = src;
   lastSetEpoch = tv.tv_sec;
   lastSetMs = millis();
+  rtcSeedReq = false;
   if (src != SRC_RTC) { rtcWritePending = true; rtcWriteReqMs = millis(); rtcCancelAlign(); }
   requestRecalcAll();
 }
 
-static bool     rtcPresent = false;
-static bool     rtcLost = false;
-static time_t   rtcEpoch = 0;
-static float    rtcTemp = 0;
-static int32_t  rtcDrift = 0;
-static uint32_t rtcReadMs = 0, rtcTempMs = 0, rtcProbeMs = 0;
-static bool     rtcAlignReq = false;
-static uint32_t rtcAlignStartMs = 0;
-static time_t   rtcAlignPrev = 0;
-static uint32_t rtcSetCount = 0;
+static bool rtcUsable();
 
 static void rtcProbe() {
-  if (!timeCfg.rtcEnabled) { rtcPresent = false; return; }
+  if (!timeCfg.rtcEnabled) { rtcPresent = false; rtcSeedReq = false; return; }
   rtcPresent = rtc.begin(&Wire);
-  if (rtcPresent) {
-    rtcLost = rtc.lostPower();
-    DateTime d = rtc.now();
-    rtcEpoch = (time_t)d.unixtime();
-    rtcTemp = rtc.getTemperature();
+  if (!rtcPresent) { rtcSeedReq = false; return; }
+  rtcLost = rtc.lostPower();
+  DateTime d = rtc.now();
+  rtcEpoch = (time_t)d.unixtime();
+  rtcTemp = rtc.getTemperature();
+  if (!rtcLost && !timeIsValid(rtcEpoch)) rtcLost = true;
+  if (rtcUsable()) {
     rtcReadMs = rtcTempMs = millis();
-    if (!rtcLost && !timeIsValid(rtcEpoch)) rtcLost = true;
+    rtcDrift = 0;
+    if (!clockValid()) rtcSeedReq = true;
+    else rtcSeedReq = false;
+  } else {
+    rtcReadMs = rtcTempMs = 0;
+    rtcDrift = 0;
+    rtcSeedReq = false;
+    rtcLostRetryMs = millis();
   }
 }
 
 static bool rtcUsable() { return timeCfg.rtcEnabled && rtcPresent && !rtcLost && timeIsValid(rtcEpoch); }
 
-static void rtcCancelAlign() { rtcAlignReq = false; }
+static void rtcCancelAlign() { rtcAlignReq = false; rtcSeedReq = false; }
 
 static void rtcRequestAlignSet() {
   if (!rtcUsable()) return;
@@ -1174,22 +1231,50 @@ static void rtcRequestAlignSet() {
 }
 
 static void rtcTick() {
-  if (!timeCfg.rtcEnabled) { rtcPresent = false; rtcWritePending = false; rtcAlignReq = false; return; }
+  if (!timeCfg.rtcEnabled) {
+    rtcPresent = false;
+    rtcWritePending = false;
+    rtcAlignReq = false;
+    rtcSeedReq = false;
+    return;
+  }
   if (!rtcPresent) {
-    if (elapsed(rtcProbeMs, 30000)) { rtcProbeMs = millis(); rtcProbe(); }
+    if (elapsed(rtcProbeMs, 30000)) {
+      rtcProbeMs = millis();
+      bool wasPending = rtcWritePending;
+      rtcProbe();
+      if (wasPending && rtcPresent) rtcWriteReqMs = millis();
+    }
     return;
   }
   if (rtcWritePending) {
     struct timeval tv; gettimeofday(&tv, nullptr);
     if (timeIsValid(tv.tv_sec) && (tv.tv_usec < 40000 || elapsed(rtcWriteReqMs, 1500))) {
-      rtc.adjust(DateTime((uint32_t)tv.tv_sec));
+      bool wrote = rtc.adjust(DateTime((uint32_t)tv.tv_sec));
       rtcWritePending = false;
-      rtcLost = false;
-      rtcEpoch = tv.tv_sec;
-      rtcDrift = 0;
-      rtcSetCount++;
-      rtcReadMs = millis();
+      if (wrote) {
+        rtcLost = false;
+        rtcEpoch = tv.tv_sec;
+        rtcDrift = 0;
+        rtcSetCount++;
+        rtcReadMs = millis();
+      }
+      rtcLostRetryMs = millis();
     }
+    return;
+  }
+  if (rtcSeedReq) {
+    if (clockValid()) { rtcSeedReq = false; return; }
+    if (rtcUsable()) {
+      rtcSeedReq = false;
+      setSystemTime((double)rtcEpoch + 0.5, SRC_RTC);
+      rtcRequestAlignSet();
+      return;
+    }
+    rtcSeedReq = false;
+  }
+  if (rtcLost) {
+    if (elapsed(rtcLostRetryMs, 30000)) { rtcLostRetryMs = millis(); rtcProbe(); }
     return;
   }
   if (rtcAlignReq) {
@@ -1199,6 +1284,7 @@ static void rtcTick() {
     if (e != rtcAlignPrev || elapsed(rtcAlignStartMs, 1300)) {
       rtcAlignReq = false;
       if (timeIsValid(e)) { setSystemTime((double)e + 0.001, SRC_RTC); rtcDrift = 0; }
+      else { rtcLost = true; rtcLostRetryMs = millis(); }
     }
     return;
   }
@@ -1206,8 +1292,8 @@ static void rtcTick() {
     rtcReadMs = millis();
     DateTime d = rtc.now();
     rtcEpoch = (time_t)d.unixtime();
-    rtcDrift = (int32_t)(rtcEpoch - time(nullptr));
-    if (!timeIsValid(rtcEpoch)) rtcLost = true;
+    if (!timeIsValid(rtcEpoch)) { rtcLost = true; rtcLostRetryMs = millis(); return; }
+    rtcDrift = clockValid() ? (int32_t)(rtcEpoch - time(nullptr)) : 0;
   }
   if (elapsed(rtcTempMs, 10000)) { rtcTempMs = millis(); rtcTemp = rtc.getTemperature(); }
 }
@@ -1891,11 +1977,14 @@ static void fillTimeStatus(JsonObject o) {
   JsonObject r = o["rtc"].to<JsonObject>();
   r["en"] = timeCfg.rtcEnabled;
   r["ok"] = rtcPresent;
+  r["usable"] = timeCfg.rtcEnabled && rtcPresent && !rtcLost;
   r["lost"] = rtcLost;
   r["e"] = (uint32_t)rtcEpoch;
   r["t"] = rtcPresent ? rtcTemp : 0.0f;
   r["drift"] = rtcPresent ? (long)rtcDrift : 0L;
   r["w"] = rtcSetCount;
+  r["seed"] = rtcSeedReq;
+  r["align"] = rtcAlignReq;
 }
 
 static const char* staStateStr() {
@@ -2029,7 +2118,14 @@ static void apiTimeCfgPost() {
   markDirty(D_TIME);
   if (tzChanged) { applyTimezone(); if (timeCfg.tzMode == 1) tzTriggerNow(); }
   if (ntpChanged) { ntpAbort(); ntpIdx = 0; ntpCycleTries = 0; ntpBackoffMs = 0; ntpTriggerNow(); }
-  if (rtcChanged) { if (timeCfg.rtcEnabled) rtcProbe(); else rtcPresent = false; }
+  if (rtcChanged) {
+    if (timeCfg.rtcEnabled) rtcProbe();
+    else {
+      rtcPresent = false; rtcLost = false; rtcEpoch = 0; rtcTemp = 0; rtcDrift = 0;
+      rtcSeedReq = false; rtcAlignReq = false; rtcWritePending = false;
+      rtcWriteReqMs = 0; rtcLostRetryMs = 0; rtcReadMs = 0; rtcTempMs = 0;
+    }
+  }
   apiTimeCfgGet();
 }
 
@@ -2084,6 +2180,7 @@ static void apiTimeRtcRead() {
 static void apiTimeRtcWrite() {
   if (!(timeCfg.rtcEnabled && rtcPresent)) { sendErr(409, "DS3231 not present"); return; }
   if (!clockValid()) { sendErr(409, "system clock is not valid"); return; }
+  rtcCancelAlign();
   rtcWritePending = true; rtcWriteReqMs = millis();
   sendOk();
 }
@@ -2558,7 +2655,7 @@ var timePage=function(){
   var MONTHS=[[1,'Jan'],[2,'Feb'],[3,'Mar'],[4,'Apr'],[5,'May'],[6,'Jun'],[7,'Jul'],[8,'Aug'],[9,'Sep'],[10,'Oct'],[11,'Nov'],[12,'Dec']],WEEKS=[[1,'1st'],[2,'2nd'],[3,'3rd'],[4,'4th'],[5,'last']],DAYS=[[0,'Sun'],[1,'Mon'],[2,'Tue'],[3,'Wed'],[4,'Thu'],[5,'Fri'],[6,'Sat']];
   var form=async function(){try{var c=await api('/api/time/cfg');var f=$('#tf');
     f.innerHTML='<h3>NTP</h3><div class="row">'+[0,1,2,3].map(function(i){return '<div><label>Server '+(i+1)+'</label><input type="text" name="ntp'+i+'" value="'+esc(c.ntp[i]||'')+'" maxlength="48"></div>';}).join('')+'</div><div class="row"><div><label>Auto sync interval (minutes, 1 - 1440 = 24 h)</label><input type="number" name="interval" min="1" max="1440" value="'+c.interval+'"></div><div><label>Reply timeout per server (ms)</label><input type="number" name="timeout" min="500" max="10000" value="'+c.timeout+'"></div></div><label class="chk"><input type="checkbox" name="rotate"'+(c.rotate?' checked':'')+'> Rotate servers (round-robin each sync). Off = always start with server 1, fall back to the next on failure.</label>'
-      +'<h3>Clock sources</h3><label class="chk"><input type="checkbox" name="rtc"'+(c.rtc?' checked':'')+'> Use DS3231 RTC (I2C SDA 21 / SCL 22): seeds the clock at boot, keeps it disciplined while offline, written after every NTP / browser sync.</label><label class="chk"><input type="checkbox" name="autoBrowser"'+(c.autoBrowser?' checked':'')+'> Automatic browser sync when the clock is not set (NTP unreachable, no RTC).</label>'
+      +'<h3>Clock sources</h3><label class="chk"><input type="checkbox" name="rtc"'+(c.rtc?' checked':'')+'> Use DS3231 RTC (I2C SDA 21 / SCL 22): seeds the clock at boot and when re-detected, re-disciplines it after a station disconnect, and is written after every NTP / browser sync. It does not tick the system clock while offline - use NTP or browser sync for that.</label><label class="chk"><input type="checkbox" name="autoBrowser"'+(c.autoBrowser?' checked':'')+'> Automatic browser sync when the clock is not set (NTP unreachable, no RTC).</label>'
       +'<h3>Time zone</h3><div class="row"><div><label>Mode</label>'+sel('tzMode',[[0,'Manual (offset / rules / POSIX)'],[1,'Automatic (IP geolocation + DST rules)']],c.tzMode)+'</div><div><label>GMT offset in seconds (e.g. -18000 = UTC-5, 3600 = UTC+1) <span class="mut" id="offh"></span></label><input type="number" name="gmtOffset" min="-50400" max="50400" step="1" value="'+c.gmtOffset+'"></div><div><label>DST offset (seconds)</label><input type="number" name="dstOffset" min="-7200" max="7200" value="'+c.dstOffset+'"></div></div>'
       +'<label class="chk"><input type="checkbox" name="dst"'+(c.dst?' checked':'')+'> Daylight saving time rules enabled</label><div class="row"><div><label>DST starts</label><div class="row">'+sel('dsM',MONTHS,c.dsM)+sel('dsW',WEEKS,c.dsW)+sel('dsD',DAYS,c.dsD)+'<input type="number" name="dsH" min="0" max="24" value="'+c.dsH+'" title="hour (local standard time)"></div></div><div><label>DST ends</label><div class="row">'+sel('deM',MONTHS,c.deM)+sel('deW',WEEKS,c.deW)+sel('deD',DAYS,c.deD)+'<input type="number" name="deH" min="0" max="24" value="'+c.deH+'" title="hour (local DST time)"></div></div></div>'
       +'<div><span class="mut" style="font-size:12px">Presets:</span> <button type="button" class="btn s" data-p="us">USA/Canada</button><button type="button" class="btn s" data-p="eu">EU (CET)</button><button type="button" class="btn s" data-p="uk">UK/Portugal</button><button type="button" class="btn s" data-p="au">Australia SE</button><button type="button" class="btn s" data-p="nz">New Zealand</button></div>'
@@ -2726,4 +2823,3 @@ void loop() {
     ESP.restart();
   }
 }
-
