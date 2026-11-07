@@ -1250,15 +1250,13 @@ static void rtcTick() {
   if (rtcWritePending) {
     struct timeval tv; gettimeofday(&tv, nullptr);
     if (timeIsValid(tv.tv_sec) && (tv.tv_usec < 40000 || elapsed(rtcWriteReqMs, 1500))) {
-      bool wrote = rtc.adjust(DateTime((uint32_t)tv.tv_sec));
+      rtc.adjust(DateTime((uint32_t)tv.tv_sec));
       rtcWritePending = false;
-      if (wrote) {
-        rtcLost = false;
-        rtcEpoch = tv.tv_sec;
-        rtcDrift = 0;
-        rtcSetCount++;
-        rtcReadMs = millis();
-      }
+      rtcLost = false;
+      rtcEpoch = tv.tv_sec;
+      rtcDrift = 0;
+      rtcSetCount++;
+      rtcReadMs = millis();
       rtcLostRetryMs = millis();
     }
     return;
@@ -2823,4 +2821,3 @@ void loop() {
     ESP.restart();
   }
 }
-
