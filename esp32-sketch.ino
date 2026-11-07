@@ -653,10 +653,12 @@ static void saveDirtyNow() {
   if (!dirtyMask) return;
   uint32_t m = dirtyMask;
   dirtyMask = 0;
-  if (m & D_NET)  saveNet();
-  if (m & D_TIME) saveTime();
-  if (m & D_GPIO) saveGpio();
-  for (uint8_t i = 0; i < NUM_RELAYS; i++) if (m & (D_RELAY0 << i)) saveRelay(i);
+  uint32_t failed = 0;
+  if ((m & D_NET)  && !saveNet())  failed |= D_NET;
+  if ((m & D_TIME) && !saveTime()) failed |= D_TIME;
+  if ((m & D_GPIO) && !saveGpio()) failed |= D_GPIO;
+  for (uint8_t i = 0; i < NUM_RELAYS; i++) if ((m & (D_RELAY0 << i)) && !saveRelay(i)) failed |= (D_RELAY0 << i);
+  if (failed) { dirtyMask |= failed; dirtyAtMs = millis(); }
 }
 
 static void storageTick() {
@@ -1147,12 +1149,14 @@ static void applyTimezone() {
     buildManualPosix(buf, sizeof buf);
     strcopy(tzSource, sizeof tzSource, "manual");
   }
+  bool tzApplied = false;
   if (strcmp(buf, tzCurrent) != 0 || getenv("TZ") == nullptr) {
     strcopy(tzCurrent, sizeof tzCurrent, buf);
     setenv("TZ", tzCurrent, 1);
     tzset();
+    tzApplied = true;
   }
-  requestRecalcAll();
+  if (tzApplied) requestRecalcAll();
 }
 
 static const char* const SRC_NAMES[] = {"none", "rtc", "ntp", "browser"};
@@ -1162,6 +1166,7 @@ static time_t   lastSetEpoch = 0;
 static uint32_t lastSetMs = 0;
 static bool     rtcWritePending = false;
 static uint32_t rtcWriteReqMs = 0;
+static uint32_t rtcWriteStartMs = 0;
 
 static void rtcCancelAlign();
 
@@ -1191,11 +1196,17 @@ static void setSystemTime(double epoch, TimeSrc src) {
   lastSetEpoch = tv.tv_sec;
   lastSetMs = millis();
   rtcSeedReq = false;
-  if (src != SRC_RTC) { rtcWritePending = true; rtcWriteReqMs = millis(); rtcCancelAlign(); }
+  if (src != SRC_RTC) { rtcWritePending = true; rtcWriteReqMs = millis(); rtcWriteStartMs = millis(); rtcCancelAlign(); }
   requestRecalcAll();
 }
 
 static bool rtcUsable();
+
+template <typename R>
+static auto rtcAdjust(R& r, DateTime d, int) -> decltype(r.adjust(d), bool()) { return r.adjust(d); }
+template <typename R>
+static bool rtcAdjust(R& r, DateTime d, long) { r.adjust(d); return true; }
+static bool rtcWriteTime(uint32_t epoch) { return rtcAdjust(rtc, DateTime(epoch), 0); }
 
 static void rtcProbe() {
   if (!timeCfg.rtcEnabled) { rtcPresent = false; rtcSeedReq = false; return; }
@@ -1234,6 +1245,7 @@ static void rtcTick() {
   if (!timeCfg.rtcEnabled) {
     rtcPresent = false;
     rtcWritePending = false;
+    rtcWriteStartMs = 0;
     rtcAlignReq = false;
     rtcSeedReq = false;
     return;
@@ -1248,16 +1260,23 @@ static void rtcTick() {
     return;
   }
   if (rtcWritePending) {
+    if (!rtcWriteStartMs) rtcWriteStartMs = millis();
     struct timeval tv; gettimeofday(&tv, nullptr);
     if (timeIsValid(tv.tv_sec) && (tv.tv_usec < 40000 || elapsed(rtcWriteReqMs, 1500))) {
-      rtc.adjust(DateTime((uint32_t)tv.tv_sec));
-      rtcWritePending = false;
-      rtcLost = false;
-      rtcEpoch = tv.tv_sec;
-      rtcDrift = 0;
-      rtcSetCount++;
-      rtcReadMs = millis();
-      rtcLostRetryMs = millis();
+      bool ok = rtcWriteTime((uint32_t)tv.tv_sec);
+      if (ok) {
+        rtcWritePending = false;
+        rtcWriteStartMs = 0;
+        rtcLost = false;
+        rtcEpoch = tv.tv_sec;
+        rtcDrift = 0;
+        rtcSetCount++;
+        rtcReadMs = millis();
+        rtcLostRetryMs = millis();
+      } else {
+        rtcWriteReqMs = millis();
+        if (elapsed(rtcWriteStartMs, 30000)) { rtcWritePending = false; rtcWriteStartMs = 0; }
+      }
     }
     return;
   }
@@ -1511,7 +1530,8 @@ static uint32_t tzStateMs = 0;
 static uint32_t tzLastTryMs = 0;
 static bool     tzTried = false;
 static bool     tzDueNow = false;
-static char     tzBuf[1024];
+static char     tzReq[192];
+static char     tzBuf[2048];
 static size_t   tzLen = 0;
 static char     tzLastResult[64] = "not yet";
 static time_t   tzLastOkEpoch = 0;
@@ -1611,8 +1631,8 @@ static void tzTick() {
       break;
     }
     case TZ_SEND: {
-      int n = snprintf(tzBuf, sizeof tzBuf, "GET /json/?fields=status,message,timezone,offset HTTP/1.1\r\nHost: %s\r\nUser-Agent: ESP32Relay/" FW_VERSION "\r\nConnection: close\r\n\r\n", TZ_HOST);
-      int w = lwip_send(tzSock, tzBuf, n, 0);
+      int n = snprintf(tzReq, sizeof tzReq, "GET /json/?fields=status,message,timezone,offset HTTP/1.1\r\nHost: %s\r\nUser-Agent: ESP32Relay/" FW_VERSION "\r\nConnection: close\r\n\r\n", TZ_HOST);
+      int w = lwip_send(tzSock, tzReq, n, 0);
       if (w == n) { tzLen = 0; tzState = TZ_RECV; tzStateMs = millis(); }
       else if (w < 0 && errno != EWOULDBLOCK && errno != EAGAIN) tzFail("send");
       else if (elapsed(tzStateMs, 3000)) tzFail("send timeout");
@@ -2109,7 +2129,9 @@ static void apiTimeCfgPost() {
     if (t.posix[0] && (strlen(t.posix) < 3 || !(isalpha((unsigned char)t.posix[0]) || t.posix[0] == '<') || !strpbrk(t.posix, "0123456789"))) { sendErr(400, "POSIX string looks invalid (e.g. EST5EDT,M3.2.0,M11.1.0)"); return; }
   }
   bool tzChanged = t.tzMode != timeCfg.tzMode || t.gmtOffset != timeCfg.gmtOffset || t.dst != timeCfg.dst || t.dstOffset != timeCfg.dstOffset ||
-                   memcmp(&t.dsM, &timeCfg.dsM, 8) != 0 || strcmp(t.posix, timeCfg.posix) != 0;
+                   t.dsM != timeCfg.dsM || t.dsW != timeCfg.dsW || t.dsD != timeCfg.dsD || t.dsH != timeCfg.dsH ||
+                   t.deM != timeCfg.deM || t.deW != timeCfg.deW || t.deD != timeCfg.deD || t.deH != timeCfg.deH ||
+                   strcmp(t.posix, timeCfg.posix) != 0;
   bool ntpChanged = memcmp(t.ntp, timeCfg.ntp, sizeof(t.ntp)) != 0 || t.intervalMin != timeCfg.intervalMin;
   bool rtcChanged = t.rtcEnabled != timeCfg.rtcEnabled;
   timeCfg = t;
@@ -2120,7 +2142,7 @@ static void apiTimeCfgPost() {
     if (timeCfg.rtcEnabled) rtcProbe();
     else {
       rtcPresent = false; rtcLost = false; rtcEpoch = 0; rtcTemp = 0; rtcDrift = 0;
-      rtcSeedReq = false; rtcAlignReq = false; rtcWritePending = false;
+      rtcSeedReq = false; rtcAlignReq = false; rtcWritePending = false; rtcWriteStartMs = 0;
       rtcWriteReqMs = 0; rtcLostRetryMs = 0; rtcReadMs = 0; rtcTempMs = 0;
     }
   }
@@ -2179,7 +2201,7 @@ static void apiTimeRtcWrite() {
   if (!(timeCfg.rtcEnabled && rtcPresent)) { sendErr(409, "DS3231 not present"); return; }
   if (!clockValid()) { sendErr(409, "system clock is not valid"); return; }
   rtcCancelAlign();
-  rtcWritePending = true; rtcWriteReqMs = millis();
+  rtcWritePending = true; rtcWriteReqMs = millis(); rtcWriteStartMs = millis();
   sendOk();
 }
 
