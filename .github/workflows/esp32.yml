@@ -38,7 +38,7 @@ jobs:
         arduino-cli lib install "RTClib"
         
         # Compile firmware
-        mv *.ino esp32-plant-care.ino
+        mv *.ino esp32-timer-switch.ino
         arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=noota_ffat --output-dir firmware .
 
         # Rename
