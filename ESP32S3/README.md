@@ -6,7 +6,7 @@
 
 # Installation
 > Download and Flash the firmware to offset `0x0`
-- 
+- https://github.com/xiv3r/esp32-timer-switch/blob/main/ESP32S3/esp32s3-dump-0x0.bin
 
 # Wifi Key
 - SSID: `ESP32S_Timer_Switch_XXXX`
