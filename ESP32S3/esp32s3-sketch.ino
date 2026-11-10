@@ -1482,6 +1482,7 @@ static void ntpHandleReply() {
   uint8_t li = pkt[0] >> 6, mode = pkt[0] & 7, stratum = pkt[1];
   if (mode != 4 && mode != 5) { ntpFail("bad mode"); return; }
   if (stratum == 0) { ntpFail("kiss-of-death"); return; }
+  if (stratum > 15) { ntpFail("bad stratum"); return; }
   if (li == 3) { ntpFail("server unsynchronized"); return; }
   double T2 = ntpTs(pkt + 32), T3 = ntpTs(pkt + 40);
   if (T3 < (double)MIN_VALID_EPOCH) { ntpFail("implausible time"); return; }
@@ -1790,7 +1791,7 @@ static void onStaDown(uint8_t reason) {
   staBackoffMs = staBackoffMs ? min<uint32_t>(staBackoffMs * 2, 30000) : 2000;
   staNextTryMs = millis() + staBackoffMs;
   if (ntpState != NTP_IDLE) { ntpAbort(); ntpDueNow = true; }
-  if (tzState != TZ_IDLE) tzClose();
+  if (tzState != TZ_IDLE) { tzClose(); tzTried = false; if (timeCfg.tzMode == 1) tzDueNow = true; }
   if (wasUp) rtcRequestAlignSet();
 }
 
