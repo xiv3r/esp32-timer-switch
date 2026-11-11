@@ -903,12 +903,12 @@ static int64_t findPrevMatch(const Spec& s, const struct tm& now) {
   }
   if (Dmin < Dhard) Dmin = Dhard;
   int64_t D = D0;
-  const int guardLimit = (int)(D0 - Dmin) + 64;
-  int guard = 0;
+  int64_t guardLimit = (D0 - Dmin) + 64;
+  if (guardLimit < 0) guardLimit = 0;
+  int64_t guard = 0;
   while (D > Dmin && guard++ < guardLimit) {
     int y, m, d;
     civilFromDays(D, y, m, d);
-    if (y > s.y1) { D = daysFromCivil(s.y1, 12, 31); continue; }
     if (y < s.y0) return -1;
     if (!((s.mon >> m) & 1u)) { D = daysFromCivil(y, m, 1) - 1; continue; }
     if (!((s.dom >> d) & 1u) || !((s.dow >> dowFromDays(D)) & 1u)) { D--; continue; }
@@ -968,7 +968,7 @@ static void evalSecond(const struct tm& lt) {
   }
 }
 
-static void applyOutputs(bool force);
+static void applyOutputs();
 
 static void schedTick() {
   time_t now = time(nullptr);
@@ -1035,10 +1035,10 @@ static bool desiredState(uint8_t i) {
   return clockValid() && relayAnyActive(r);
 }
 
-static void applyOutputs(bool force) {
+static void applyOutputs() {
   for (uint8_t i = 0; i < NUM_RELAYS; i++) {
     bool want = desiredState(i);
-    if (want != relays[i].state || force) {
+    if (want != relays[i].state) {
       relays[i].state = want;
       if (relays[i].driven) digitalWrite(gpioCfg.pin[i], physicalLevel(i, want));
     }
@@ -1239,7 +1239,11 @@ namespace rtc_detail {
     }
   };
 }
-static bool rtcWriteTime(uint32_t epoch) { return rtc_detail::Adjust<RTC_DS3231>::call(rtc, DateTime(epoch)); }
+static bool rtcWriteTime(time_t epoch) {
+  if (!timeT64() && epoch > (time_t)2147483647) return false;
+  if (timeT64() && (uint64_t)epoch > 4102444800ULL) return false;
+  return rtc_detail::Adjust<RTC_DS3231>::call(rtc, DateTime((uint32_t)epoch));
+}
 
 static void rtcProbe() {
   if (!timeCfg.rtcEnabled) { rtcPresent = false; rtcSeedReq = false; return; }
@@ -1296,7 +1300,7 @@ static void rtcTick() {
     if (!rtcWriteStartMs) rtcWriteStartMs = millis();
     struct timeval tv; gettimeofday(&tv, nullptr);
     if (timeIsValid(tv.tv_sec) && (tv.tv_usec < 40000 || elapsed(rtcWriteReqMs, 1500))) {
-      bool ok = rtcWriteTime((uint32_t)tv.tv_sec);
+      bool ok = rtcWriteTime(tv.tv_sec);
       if (ok) {
         rtcWritePending = false;
         rtcWriteStartMs = 0;
@@ -1510,6 +1514,7 @@ static void ntpHandleReply() {
   double offset = ((T2 - ntpT1) + (T3 - t4)) / 2.0;
   double newTime = t4 + offset;
   bool had = clockValid();
+  if (had && fabs(offset) > 86400.0) { ntpFail("offset implausible"); return; }
   ntpLastOffsetMs = had ? offset * 1000.0 : 0;
   setSystemTime(newTime, SRC_NTP);
   ntpLastOk = (time_t)newTime;
@@ -1552,7 +1557,8 @@ static void ntpTick() {
 }
 
 static uint32_t ntpSecondsToNext() {
-  if (!staHasIp || ntpDueNow || ntpState != NTP_IDLE) return 0;
+  if (!staHasIp || ntpState != NTP_IDLE) return 0;
+  if (ntpDueNow) return 0;
   int32_t d = (int32_t)(ntpDueMs - millis());
   return d > 0 ? (uint32_t)d / 1000 : 0;
 }
@@ -2198,8 +2204,7 @@ static void apiTimeSet() {
   double epoch = d["epoch"].as<double>();
   int ms = d["ms"] | 0;
   if (ms < 0 || ms > 999) ms = 0;
-  double frac = epoch - floor(epoch);
-  if (frac > 0.0005) ms = 0;
+  if (epoch - floor(epoch) > 0.0005) ms = 0;
   double maxEpoch = timeT64() ? 4102444800.0 : 2147483647.0;
   if (epoch < (double)MIN_VALID_EPOCH || epoch > maxEpoch) { sendErr(400, "epoch out of range"); return; }
   setSystemTime(epoch + ms / 1000.0, SRC_BROWSER);
@@ -2494,10 +2499,15 @@ static void apiSystem() {
       File f = dir.openNextFile();
       int guard = 0;
       while (f && guard++ < 80) {
-        JsonObject o = files.add<JsonObject>();
         const char* nm = f.name(); const char* base = strrchr(nm, '/');
-        o["n"] = base ? base + 1 : nm;
-        o["s"] = (uint32_t)f.size();
+        const char* name = base ? base + 1 : nm;
+        size_t ln = strlen(name);
+        bool variant = (ln > 4 && (strcmp(name + ln - 4, ".bak") == 0 || strcmp(name + ln - 4, ".tmp") == 0));
+        if (!variant) {
+          JsonObject o = files.add<JsonObject>();
+          o["n"] = name;
+          o["s"] = (uint32_t)f.size();
+        }
         f.close();
         f = dir.openNextFile();
       }
