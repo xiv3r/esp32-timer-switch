@@ -975,7 +975,7 @@ static void schedTick() {
   if (!timeIsValid(now)) {
     schedLastEval = 0;
     schedForceRecalc = true;
-    applyOutputs(false);
+    applyOutputs();
     return;
   }
   if (!schedForceRecalc && now == schedLastEval) return;
@@ -1001,7 +1001,7 @@ static void schedTick() {
   localtime_r(&now, &lt);
   schedLastLocal = localPseudoEpoch(lt);
   schedLastEval = now;
-  applyOutputs(false);
+  applyOutputs();
 }
 
 static inline int physicalLevel(uint8_t i, bool on) { return (on ^ gpioCfg.activeLow[i]) ? HIGH : LOW; }
@@ -2292,7 +2292,7 @@ static void apiRelayPost() {
   r.mode = (uint8_t)mode;
   if (hasS) { memcpy(r.p, tmpPairs, sizeof(tmpPairs)); recalcRelayNow(i); }
   markDirty(D_RELAY0 << i);
-  applyOutputs(false);
+  applyOutputs();
   JsonDocument out; relayToDoc(i, out, true); sendDoc(out);
 }
 
@@ -2303,7 +2303,7 @@ static void apiRelayMode() {
   if (mode < 0 || mode > 2) { sendErr(400, "mode must be 0,1,2"); return; }
   relays[i].mode = (uint8_t)mode;
   markDirty(D_RELAY0 << i);
-  applyOutputs(false);
+  applyOutputs();
   JsonDocument o; o["ok"] = true; o["mode"] = relays[i].mode; o["state"] = relays[i].state; sendDoc(o);
 }
 
@@ -2347,7 +2347,7 @@ static void apiGpioLevel() {
   if (!relays[i].driven) { sendErr(409, "GPIO is reserved or not drivable in this build"); return; }
   relays[i].mode = lvl ? 1 : 2;
   markDirty(D_RELAY0 << i);
-  applyOutputs(false);
+  applyOutputs();
   sendOk();
 }
 
@@ -2355,12 +2355,12 @@ static void apiGpioAll() {
   JsonDocument d; if (!readBody(d)) return;
   if (d["auto"] | false) {
     for (uint8_t i = 0; i < NUM_RELAYS; i++) if (relays[i].mode != 0) { relays[i].mode = 0; recalcRelayNow(i); markDirty(D_RELAY0 << i); }
-    applyOutputs(false); sendOk(); return;
+    applyOutputs(); sendOk(); return;
   }
   int lvl = d["level"] | -1;
   if (lvl != 0 && lvl != 1) { sendErr(400, "level must be 0 or 1"); return; }
   for (uint8_t i = 0; i < NUM_RELAYS; i++) if (gpioCfg.pin[i] >= 0) { relays[i].mode = lvl ? 1 : 2; markDirty(D_RELAY0 << i); }
-  applyOutputs(false);
+  applyOutputs();
   sendOk();
 }
 
