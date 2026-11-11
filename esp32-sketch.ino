@@ -54,7 +54,6 @@ static const char* F_TIME    = "/cfg/time.json";
 static const char* F_GPIO    = "/cfg/gpio.json";
 
 static const uint8_t TX_POWER_VALUES[] = {78, 68, 60, 52, 44, 34, 28, 20, 8};
-static const char* const TX_POWER_LABELS[] = {"19.5 dBm (max)", "17 dBm", "15 dBm", "13 dBm", "11 dBm", "8.5 dBm", "7 dBm", "5 dBm", "2 dBm"};
 static const uint8_t TX_POWER_COUNT = sizeof(TX_POWER_VALUES) / sizeof(TX_POWER_VALUES[0]);
 
 struct StaCfg {
@@ -370,6 +369,22 @@ static bool saveJsonAtomic(const char* path, JsonDocument& doc) {
     LittleFS.remove(tmp);
     return false;
   }
+  if (!LittleFS.exists(bak)) {
+    File src = LittleFS.open(path, "r");
+    if (src) {
+      File dst = LittleFS.open(bak, "w");
+      if (dst) {
+        uint8_t cbuf[256];
+        while (src.available()) {
+          int n = src.read(cbuf, sizeof(cbuf));
+          if (n <= 0) break;
+          if (dst.write(cbuf, (size_t)n) != (size_t)n) { dst.close(); src.close(); LittleFS.remove(bak); return true; }
+        }
+        dst.close();
+      }
+      src.close();
+    }
+  }
   return true;
 }
 
@@ -574,7 +589,8 @@ static void netFromDoc(JsonDocument& d) {
     netCfg.ap.captive = a["captive"] | netCfg.ap.captive;
     int md = a["mode"] | (int)netCfg.ap.mode; if (md == 0 || md == 1) netCfg.ap.mode = md;
   }
-  if (strlen(netCfg.ap.pass) > 0 && strlen(netCfg.ap.pass) < 8) netCfg.ap.pass[0] = 0;
+  size_t apl = strlen(netCfg.ap.pass);
+  if (apl > 0 && apl < 8) strcopy(netCfg.ap.pass, sizeof(netCfg.ap.pass), "12345678");
 }
 
 static void timeFromDoc(JsonDocument& d) {
@@ -765,13 +781,13 @@ static const char* parseYearField(const char* s, uint16_t& y0, uint16_t& y1) {
   b = a;
   if (*p == '-') { p++; if (!parseValue(p, nullptr, 0, 0, b)) return "bad year range"; }
   if (*p) return "unexpected character in year";
-  if (a < 1970 || a > 2199 || b < 1970 || b > 2199) return "year out of range (1970-2199)";
+  if (a < 2000 || a > 2199 || b < 2000 || b > 2199) return "year out of range (2000-2199)";
   if (b < a) return "year range reversed";
   y0 = a; y1 = b;
   return nullptr;
 }
 
-static const char* FIELD_NAMES[7] = {"sec", "min", "hour", "dow", "dom", "month", "year"};
+static const char* const FIELD_NAMES[7] = {"sec", "min", "hour", "dow", "dom", "month", "year"};
 static char specErr[64];
 
 static const char* parseSpec(const char* str, Spec& sp) {
@@ -876,13 +892,16 @@ static time_t pseudoToReal(int64_t pseudo) {
 
 static int64_t findPrevMatch(const Spec& s, const struct tm& now) {
   if (s.never) return -1;
+  if (!timeT64() && s.y0 > 2037) return -1;
   const int64_t D0 = daysFromCivil(now.tm_year + 1900, now.tm_mon + 1, now.tm_mday);
   const int S0 = now.tm_hour * 3600 + now.tm_min * 60 + now.tm_sec;
   int64_t Dmin = D0 - DAY_LOOKBACK;
-  if (s.y1 != 0xFFFF && (int)s.y1 < now.tm_year + 1900 - 8) {
+  int64_t Dhard = D0 - DAY_LOOKBACK;
+  if (s.y1 != 0xFFFF && (int)s.y1 < now.tm_year + 1900 - (DAY_LOOKBACK / 366)) {
     int64_t yStart = daysFromCivil((int)s.y0, 1, 1);
-    if (yStart - 1 < Dmin) Dmin = yStart - 1;
+    if (yStart - 1 > Dhard) Dmin = yStart - 1;
   }
+  if (Dmin < Dhard) Dmin = Dhard;
   int64_t D = D0;
   const int guardLimit = (int)(D0 - Dmin) + 64;
   int guard = 0;
@@ -1131,7 +1150,7 @@ static void buildManualPosix(char* out, size_t n) {
            timeCfg.dsM, timeCfg.dsW, timeCfg.dsD, timeCfg.dsH, timeCfg.deM, timeCfg.deW, timeCfg.deD, timeCfg.deH);
 }
 
-static char tzCurrent[80] = "UTC0";
+static char tzCurrent[80] = "";
 static char tzSource[16] = "manual";
 
 static void applyTimezone() {
@@ -1722,6 +1741,8 @@ static void startMdns() {
 
 static void startAp() {
   WiFi.enableAP(true);
+  IPAddress ip(netCfg.ap.ip);
+  WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
   const char* pass = netCfg.ap.pass[0] ? netCfg.ap.pass : nullptr;
   bool ok = WiFi.softAP(netCfg.ap.ssid, pass, netCfg.ap.channel, netCfg.ap.hidden ? 1 : 0, netCfg.ap.maxConn);
   if (!ok) {
@@ -1729,8 +1750,6 @@ static void startAp() {
     snprintf(fb, sizeof fb, "ESP32_Timer_Switch_%02X%02X", mac[4], mac[5]);
     WiFi.softAP(fb, nullptr, 1, 0, 4);
   }
-  IPAddress ip(netCfg.ap.ip);
-  WiFi.softAPConfig(ip, ip, IPAddress(255, 255, 255, 0));
   WiFi.setTxPower((wifi_power_t)netCfg.ap.txPower);
   apActive = true;
   if (netCfg.ap.captive) {
@@ -1983,12 +2002,12 @@ static const char* ntpStateStr() { return ntpState == NTP_IDLE ? (staHasIp ? "id
 
 static void fillTimeStatus(JsonObject o) {
   struct timeval tv; gettimeofday(&tv, nullptr);
-  o["e"] = (uint32_t)tv.tv_sec;
+  o["e"] = (int64_t)tv.tv_sec;
   o["ms"] = (int)(tv.tv_usec / 1000);
   o["o"] = currentUtcOffset(tv.tv_sec);
   o["v"] = timeIsValid(tv.tv_sec);
   o["src"] = SRC_NAMES[timeSrc];
-  o["set"] = (uint32_t)lastSetEpoch;
+  o["set"] = (int64_t)lastSetEpoch;
   o["tz"] = tzCurrent;
   o["tzs"] = tzSource;
   o["tzn"] = timeCfg.acName;
@@ -2179,6 +2198,8 @@ static void apiTimeSet() {
   double epoch = d["epoch"].as<double>();
   int ms = d["ms"] | 0;
   if (ms < 0 || ms > 999) ms = 0;
+  double frac = epoch - floor(epoch);
+  if (frac > 0.0005) ms = 0;
   double maxEpoch = timeT64() ? 4102444800.0 : 2147483647.0;
   if (epoch < (double)MIN_VALID_EPOCH || epoch > maxEpoch) { sendErr(400, "epoch out of range"); return; }
   setSystemTime(epoch + ms / 1000.0, SRC_BROWSER);
@@ -2364,7 +2385,15 @@ static void apiNetStaPost() {
   if (s.enabled && !s.ssid[0]) { sendErr(400, "SSID required to enable the station"); return; }
   if (!s.dhcp && (s.ip == 0 || s.gw == 0 || s.mask == 0)) { sendErr(400, "static mode needs IP, gateway and mask"); return; }
   bool hostChanged = strcmp(host, netCfg.hostname) != 0;
-  bool staChanged = memcmp(&s, &netCfg.sta, sizeof(StaCfg)) != 0;
+  bool staChanged = (s.enabled != netCfg.sta.enabled) ||
+                    (strcmp(s.ssid, netCfg.sta.ssid) != 0) ||
+                    (strcmp(s.pass, netCfg.sta.pass) != 0) ||
+                    (s.dhcp != netCfg.sta.dhcp) ||
+                    (s.ip != netCfg.sta.ip) ||
+                    (s.gw != netCfg.sta.gw) ||
+                    (s.mask != netCfg.sta.mask) ||
+                    (s.dns1 != netCfg.sta.dns1) ||
+                    (s.dns2 != netCfg.sta.dns2);
   netCfg.sta = s;
   strcopy(netCfg.hostname, sizeof netCfg.hostname, host);
   if (staChanged || hostChanged) markDirty(D_NET);
@@ -2391,7 +2420,16 @@ static void apiNetApPost() {
   }
   if (d["captive"].is<bool>()) a.captive = d["captive"];
   if (d["mode"].is<int>()) { int v = d["mode"]; if (v != 0 && v != 1) { sendErr(400, "mode must be 0 or 1"); return; } a.mode = v; }
-  bool changed = memcmp(&a, &netCfg.ap, sizeof(ApCfg)) != 0;
+  bool changed = (a.enabled != netCfg.ap.enabled) ||
+                 (strcmp(a.ssid, netCfg.ap.ssid) != 0) ||
+                 (strcmp(a.pass, netCfg.ap.pass) != 0) ||
+                 (a.channel != netCfg.ap.channel) ||
+                 (a.hidden != netCfg.ap.hidden) ||
+                 (a.maxConn != netCfg.ap.maxConn) ||
+                 (a.txPower != netCfg.ap.txPower) ||
+                 (a.ip != netCfg.ap.ip) ||
+                 (a.captive != netCfg.ap.captive) ||
+                 (a.mode != netCfg.ap.mode);
   netCfg.ap = a;
   if (changed) { markDirty(D_NET); scheduleNetApply(2); }
   JsonDocument o; o["ok"] = true; o["apply"] = changed; o["forced"] = !staWanted(); sendDoc(o);
@@ -2402,6 +2440,7 @@ static void apiNetScan() {
   JsonDocument d;
   if (n == WIFI_SCAN_RUNNING) { d["st"] = "running"; sendDoc(d); return; }
   if (n == WIFI_SCAN_FAILED) {
+    WiFi.scanDelete();
     int16_t r = WiFi.scanNetworks(true, true);
     d["st"] = (r == WIFI_SCAN_FAILED) ? "busy" : "started";
     sendDoc(d); return;
