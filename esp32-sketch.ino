@@ -45,7 +45,7 @@ static const time_t  MIN_VALID_EPOCH = 1577836800;
 static const uint32_t FACTORY_HOLD_MS = 5000;
 
 static const int8_t DEFAULT_PINS[NUM_RELAYS] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
-static const int8_t ALLOWED_PINS[] = {1, 2, 3, 4, 5, 13, 14, 15, 16, 17, 18, 19, 23, 25, 26, 27, 32, 33};
+static const int8_t ALLOWED_PINS[] = {23, 32, 33, 25, 26, 27, 14, 13, 1, 3, 19, 18, 5, 4, 2, 15};
 static const uint8_t ALLOWED_PIN_COUNT = sizeof(ALLOWED_PINS) / sizeof(ALLOWED_PINS[0]);
 
 static const char* CFG_DIR   = "/cfg";
@@ -910,6 +910,7 @@ static int64_t findPrevMatch(const Spec& s, const struct tm& now) {
     int y, m, d;
     civilFromDays(D, y, m, d);
     if (y < s.y0) return -1;
+    if (y > s.y1) { D--; continue; }
     if (!((s.mon >> m) & 1u)) { D = daysFromCivil(y, m, 1) - 1; continue; }
     if (!((s.dom >> d) & 1u) || !((s.dow >> dowFromDays(D)) & 1u)) { D--; continue; }
     int limit = (D == D0) ? S0 : 86399;
