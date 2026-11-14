@@ -910,6 +910,7 @@ static int64_t findPrevMatch(const Spec& s, const struct tm& now) {
     int y, m, d;
     civilFromDays(D, y, m, d);
     if (y < s.y0) return -1;
+    if (y > s.y1) { D--; continue; }
     if (!((s.mon >> m) & 1u)) { D = daysFromCivil(y, m, 1) - 1; continue; }
     if (!((s.dom >> d) & 1u) || !((s.dow >> dowFromDays(D)) & 1u)) { D--; continue; }
     int limit = (D == D0) ? S0 : 86399;
