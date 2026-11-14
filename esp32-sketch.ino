@@ -1196,6 +1196,7 @@ static float    rtcTemp = 0;
 static int32_t  rtcDrift = 0;
 static uint32_t rtcReadMs = 0, rtcTempMs = 0, rtcProbeMs = 0;
 static bool     rtcAlignReq = false;
+static bool     rtcAlignForced = false;
 static uint32_t rtcAlignStartMs = 0;
 static time_t   rtcAlignPrev = 0;
 static uint32_t rtcSetCount = 0;
@@ -1248,7 +1249,7 @@ static bool rtcWriteTime(time_t epoch) {
 static void rtcProbe() {
   if (!timeCfg.rtcEnabled) { rtcPresent = false; rtcSeedReq = false; return; }
   rtcPresent = rtc.begin(&Wire);
-  if (!rtcPresent) { rtcSeedReq = false; return; }
+  if (!rtcPresent) { rtcSeedReq = false; rtcLost = false; return; }
   rtcLost = rtc.lostPower();
   DateTime d = rtc.now();
   rtcEpoch = (time_t)d.unixtime();
@@ -1269,12 +1270,14 @@ static void rtcProbe() {
 
 static bool rtcUsable() { return timeCfg.rtcEnabled && rtcPresent && !rtcLost && timeIsValid(rtcEpoch); }
 
-static void rtcCancelAlign() { rtcAlignReq = false; rtcSeedReq = false; }
+static void rtcCancelAlign() { rtcAlignReq = false; rtcAlignForced = false; rtcSeedReq = false; }
 
-static void rtcRequestAlignSet() {
+static void rtcRequestAlignSet(bool force = false) {
   if (!rtcUsable()) return;
+  if (!force && timeSrc != SRC_RTC && lastSetMs && !elapsed(lastSetMs, 60000)) return;
   rtcAlignPrev = (time_t)rtc.now().unixtime();
   rtcAlignReq = true;
+  rtcAlignForced = force;
   rtcAlignStartMs = millis();
 }
 
@@ -1284,6 +1287,7 @@ static void rtcTick() {
     rtcWritePending = false;
     rtcWriteStartMs = 0;
     rtcAlignReq = false;
+    rtcAlignForced = false;
     rtcSeedReq = false;
     return;
   }
@@ -1310,9 +1314,14 @@ static void rtcTick() {
         rtcSetCount++;
         rtcReadMs = millis();
         rtcLostRetryMs = millis();
+        if (!rtcAlignForced) rtcAlignReq = false;
       } else {
         rtcWriteReqMs = millis();
-        if (elapsed(rtcWriteStartMs, 30000)) { rtcWritePending = false; rtcWriteStartMs = 0; }
+        if (elapsed(rtcWriteStartMs, 30000)) {
+          rtcWritePending = false;
+          rtcWriteStartMs = 0;
+          if (!rtcAlignForced) rtcAlignReq = false;
+        }
       }
     }
     return;
@@ -1337,6 +1346,7 @@ static void rtcTick() {
     rtcEpoch = e; rtcReadMs = millis();
     if (e != rtcAlignPrev || elapsed(rtcAlignStartMs, 1300)) {
       rtcAlignReq = false;
+      rtcAlignForced = false;
       if (timeIsValid(e)) { setSystemTime((double)e + 0.001, SRC_RTC); rtcDrift = 0; }
       else { rtcLost = true; rtcLostRetryMs = millis(); }
     }
@@ -1412,6 +1422,8 @@ static uint32_t ntpServerIp = 0;
 static char     ntpServerCur[49] = "";
 static uint8_t  ntpTxNonce[8];
 static double   ntpT1 = 0;
+static double   ntpT1Mono = 0;
+static double   ntpT1Epoch = 0;
 static time_t   ntpLastOk = 0;
 static char     ntpLastOkServer[49] = "";
 static char     ntpLastErr[48] = "";
@@ -1482,7 +1494,9 @@ static void ntpSendPacket() {
   pkt[1] = 0; pkt[2] = 6; pkt[3] = 0xEC;
   for (int i = 0; i < 8; i++) ntpTxNonce[i] = (uint8_t)esp_random();
   memcpy(pkt + 40, ntpTxNonce, 8);
-  ntpT1 = nowDouble();
+  ntpT1Mono = (double)esp_timer_get_time() / 1e6;
+  ntpT1Epoch = nowDouble();
+  ntpT1 = ntpT1Mono;
   if (!ntpUdp.beginPacket(IPAddress(ntpServerIp), 123) || ntpUdp.write(pkt, 48) != 48 || !ntpUdp.endPacket()) { ntpFail("udp send"); return; }
   ntpState = NTP_WAIT;
   ntpStateMs = millis();
@@ -1498,7 +1512,8 @@ static inline double ntpTs(const uint8_t* p) {
 static void ntpHandleReply() {
   uint8_t pkt[48];
   int len = ntpUdp.read(pkt, 48);
-  double t4 = nowDouble();
+  double t4Mono = (double)esp_timer_get_time() / 1e6;
+  double t4Epoch = nowDouble();
   udpDiscard(ntpUdp);
   if (len < 48) { ntpFail("short reply"); return; }
   if (memcmp(pkt + 24, ntpTxNonce, 8) != 0) { ntpFail("originate mismatch"); return; }
@@ -1509,9 +1524,13 @@ static void ntpHandleReply() {
   if (li == 3) { ntpFail("server unsynchronized"); return; }
   double T2 = ntpTs(pkt + 32), T3 = ntpTs(pkt + 40);
   if (T3 < (double)MIN_VALID_EPOCH) { ntpFail("implausible time"); return; }
-  double rtt = t4 - ntpT1;
-  if (rtt < 0 || rtt > 10) rtt = 0;
-  double offset = ((T2 - ntpT1) + (T3 - t4)) / 2.0;
+  double t1 = ntpT1Epoch;
+  double t4 = t4Epoch;
+  double monoRtt = t4Mono - ntpT1Mono;
+  double wallRtt = t4 - t1;
+  if (monoRtt < 0 || monoRtt > 2.0) { ntpFail("rtt out of range"); return; }
+  if (fabs(wallRtt - monoRtt) > 0.050) { ntpFail("clock stepped during exchange"); return; }
+  double offset = ((T2 - t1) + (T3 - t4)) / 2.0;
   double newTime = t4 + offset;
   bool had = clockValid();
   if (had && fabs(offset) > 86400.0) { ntpFail("offset implausible"); return; }
@@ -2182,7 +2201,7 @@ static void apiTimeCfgPost() {
     if (timeCfg.rtcEnabled) rtcProbe();
     else {
       rtcPresent = false; rtcLost = false; rtcEpoch = 0; rtcTemp = 0; rtcDrift = 0;
-      rtcSeedReq = false; rtcAlignReq = false; rtcWritePending = false; rtcWriteStartMs = 0;
+      rtcSeedReq = false; rtcAlignReq = false; rtcAlignForced = false; rtcWritePending = false; rtcWriteStartMs = 0;
       rtcWriteReqMs = 0; rtcLostRetryMs = 0; rtcReadMs = 0; rtcTempMs = 0;
     }
   }
@@ -2234,7 +2253,7 @@ static void apiTimeTzDetect() {
 
 static void apiTimeRtcRead() {
   if (!rtcUsable()) { sendErr(409, "DS3231 not available or its time is invalid"); return; }
-  rtcRequestAlignSet();
+  rtcRequestAlignSet(true);
   sendOk();
 }
 
@@ -2634,7 +2653,7 @@ var renderClock=function(){var el=$('#clock');if(!el)return;var n=devNowMs();if(
   var d=new Date(n+tm.o*1000);el.innerHTML='<span class="'+(tm.v?'ok':'bad')+'">'+fmtDate(d)+' '+fmtTime(d)+'</span><small>'+(tm.v?'device time &middot; '+esc(tm.src):'CLOCK NOT SET')+'</small>';}
 var autoSynced=false;
 var pollTime=async function(){try{var t=await api('/api/time');tm={ok:true,e:t.e,ms:t.ms,o:t.o,v:t.v,src:t.src,at:performance.now()};renderClock();
-  if(!t.v&&t.ab&&!autoSynced){autoSynced=true;try{var now=Date.now();await api('/api/time/set',{epoch:Math.floor(now/1000),ms:now%1000});toast('Device clock was not set - synchronized from this browser');pollTime();}catch(e){}}
+  if(!t.v&&t.ab&&!autoSynced){autoSynced=true;try{var now=Date.now();await api('/api/time/set',{epoch:Math.floor(now/1000),ms:now%1000});toast('Device clock was not set - synchronized from this browser');pollTime();}catch(e){autoSynced=false;}}
   }catch(e){}}
 var browserSync=function(){var now=Date.now();return api('/api/time/set',{epoch:Math.floor(now/1000),ms:now%1000}).then(function(){toast('Device clock set from browser');pollTime();}).catch(fail);};
 var shell=function(){
